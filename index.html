@@ -671,23 +671,25 @@ outDate: seg.outDate || (seg.out ? inDate : null)
 };
 }
 // 兼容旧记录（单段 inTime/outTime），输入当天字段对象，输出规范化记录
+// updatedAt 用于「本地/云端谁更新」的比较，避免笔记被旧数据覆盖
 function normRec(rec, dk) {
-if (!rec) return { segs: [], note: '', place: '' };
+if (!rec) return { segs: [], note: '', place: '', updatedAt: 0 };
 const note = rec.note || '';
 const place = rec.place || '';
+const updatedAt = rec.updatedAt || 0;
 if (Array.isArray(rec.segs)) {
 const segs = [];
 for (const s of rec.segs) { const n = normSeg(s, dk); if (n) segs.push(n); }
 segs.sort((a, b) => (a.inDate + a.in).localeCompare(b.inDate + b.in));
-return { segs, note, place };
+return { segs, note, place, updatedAt };
 }
 if (rec.inTime) {
 return {
 segs: [normSeg({ in: rec.inTime, out: rec.outTime || null, inDate: rec.inDate || dk, outDate: rec.outDate || null }, dk)],
-note, place
+note, place, updatedAt
 };
 }
-return { segs: [], note, place };
+return { segs: [], note, place, updatedAt };
 }
 function dayRec(rec, dk) { return normRec(rec, dk); }
 function daySegs(rec, dk) { return normRec(rec, dk).segs; }
@@ -1280,33 +1282,47 @@ if (!sb || !u || !u.uid) return;
 try {
 const { data, error } = await sb.from('checkins').select('*').eq('user_id', u.uid);
 if (error) { console.warn('拉取失败', error); return; }
-// 云端同一天可能有多行（每段一行），按日期归拢成一天多段
+// 云端同一天可能有多行（每段一行），按日期归拢成一天多段，并取最晚修改时间
 const byDay = {};
 for (const r of data || []) {
 const dk = r.in_date;
 if (!dk) continue;
-if (!byDay[dk]) byDay[dk] = { segs: [], note: '', place: '' };
+if (!byDay[dk]) byDay[dk] = { segs: [], note: '', place: '', updatedAt: 0 };
 byDay[dk].segs.push({ in: r.in_time || '', out: r.out_time || null, inDate: dk, outDate: r.out_date || null });
 if (!byDay[dk].note && r.note) byDay[dk].note = r.note;
 if (!byDay[dk].place && r.place) byDay[dk].place = r.place;
+const t = r.updated_at ? Date.parse(r.updated_at) : 0;
+if (t > byDay[dk].updatedAt) byDay[dk].updatedAt = t;
 }
 const cloud = {};
 for (const [dk, rec] of Object.entries(byDay)) cloud[dk] = normRec(rec, dk);
-// 合并策略：云端为基准，但本地有、云端无（离线新增），
-// 或本地曾推送失败（pending 标记）的 key，保留本地版本并补推
+// 合并策略：按「当天最后修改时间」取新，避免离线写的笔记被云端旧数据覆盖
 const oldRecords = u.records || {};
 const pending = u.pending || {};
-u.records = cloud;
 const toUpload = [];
-for (const [key, rec] of Object.entries(oldRecords)) {
-if (dayHasData(rec, key) && (!cloud[key] || pending[key])) {
-u.records[key] = normRec(rec, key);
-toUpload.push(key);
+for (const [key, localRec] of Object.entries(oldRecords)) {
+const localAt = localRec && localRec.updatedAt ? localRec.updatedAt : 0;
+const cloudAt = (cloud[key] && cloud[key].updatedAt) || 0;
+if (dayHasData(localRec, key)) {
+if (!cloud[key]) { cloud[key] = normRec(localRec, key); toUpload.push(key); }
+else if (pending[key] || localAt > cloudAt) { cloud[key] = normRec(localRec, key); toUpload.push(key); }
 }
 }
+// 保留本地有笔记但云端该天笔记为空的情况（避免笔记被空值盖掉）
+for (const [key, localRec] of Object.entries(oldRecords)) {
+if (!cloud[key] || !dayHasData(localRec, key)) continue;
+const ln = (localRec.note || '').trim();
+if (ln && !(cloud[key].note || '').trim()) {
+const merged = normRec(cloud[key], key);
+merged.note = ln;
+cloud[key] = merged;
+if (toUpload.indexOf(key) < 0) toUpload.push(key);
+}
+}
+u.records = cloud;
 saveDB();
 if (toUpload.length) {
-toast(`本地有 ${toUpload.length} 天的记录云端缺失，正在补传…`, 2000);
+toast(`本地有 ${toUpload.length} 天的记录比云端新，正在补传…`, 2000);
 for (const k of toUpload) await cloudPush(k);
 }
 } catch (e) { console.warn('拉取异常', e); }
@@ -1316,23 +1332,42 @@ for (const k of toUpload) await cloudPush(k);
 async function cloudPush(key) {
 const u = currentUser();
 if (!sb || !u || !u.uid) return;
-const rec = key != null ? normRec(u.records[key], key) : { segs: [] };
-const dayKey = key != null ? key : todayKey();
-try {
-const del = await sb.from('checkins').delete().eq('user_id', u.uid).eq('in_date', dayKey);
-if (del.error) throw del.error;
-for (let i = 0; i < rec.segs.length; i++) {
-const s = rec.segs[i];
-const up = await sb.from('checkins').upsert({
+const rec = key != null ? normRec(u.records[key], key) : { segs: [], note: '', place: '' };
+const dayKey = (key != null && rec.segs.length) ? rec.segs[0].inDate : (key != null ? key : todayKey());
+const meta = {
 user_id: u.uid,
 email: u.email || (u.phone ? u.phone + '@phone.local' : ''),
-nickname: u.nickname || '',
+nickname: u.nickname || ''
+};
+try {
+// 整天被清空：直接删掉该日全部行，不必先写
+if (key != null && !rec.segs.length) {
+const del0 = await sb.from('checkins').delete().eq('user_id', u.uid).eq('in_date', dayKey);
+if (del0.error) throw del0.error;
+if (u.pending) { delete u.pending[key]; saveDB(); }
+return;
+}
+// 先把所有段写上去，成功后再清理多余的旧行。
+// 顺序很重要：绝不能「先删后写」——中途断网会把云端已有的笔记整片删掉。
+for (let i = 0; i < rec.segs.length; i++) {
+const s = rec.segs[i];
+const up = await sb.from('checkins').upsert(Object.assign({}, meta, {
 in_date: s.inDate || dayKey, session_idx: i,
 in_time: s.in, out_date: s.out ? (s.outDate || s.inDate) : null, out_time: s.out || null,
 place: rec.place || '', note: rec.note || '',
 updated_at: new Date().toISOString()
-}, { onConflict: 'user_id,in_date,session_idx' });
+}), { onConflict: 'user_id,in_date,session_idx' });
 if (up.error) throw up.error;
+}
+// 清理比实际段数多的旧行（段被删掉的情况），最多扫 20 个位置
+for (let i = rec.segs.length; i < rec.segs.length + 20; i++) {
+const r = await sb.from('checkins').select('session_idx')
+.eq('user_id', u.uid).eq('in_date', dayKey).eq('session_idx', i).maybeSingle();
+if (r.error) break;
+if (!r.data) break;
+const d = await sb.from('checkins').delete()
+.eq('user_id', u.uid).eq('in_date', dayKey).eq('session_idx', i);
+if (d.error) break;
 }
 if (u.pending) { delete u.pending[key]; saveDB(); }
 } catch (e) {
@@ -1594,7 +1629,7 @@ if (!src || !src.records) throw new Error('nobackup');
 let merged = 0;
 for (const [k, r] of Object.entries(src.records)) {
 const rec = normRec(r, k);
-if (rec.segs.length) { u.records[k] = rec; merged += rec.segs.length; }
+if (rec.segs.length) { rec.updatedAt = rec.updatedAt || Date.now(); u.records[k] = rec; merged += rec.segs.length; }
 }
 saveDB(); renderAll(); renderSettings();
 toast(`导入完成，合并 ${merged} 条，正在同步…`, 1800);
@@ -1776,6 +1811,7 @@ for (const s of oRec.segs) {
 if (!s.out && s.inDate + s.in === openBefore.seg.inDate + openBefore.seg.in) { s.out = t; s.outDate = tk; }
 }
 if (!oRec.place) oRec.place = place;
+oRec.updatedAt = Date.now();
 user.records[openBefore.key] = oRec;
 saveDB(); cloudPush(openBefore.key);
 }
@@ -1783,12 +1819,14 @@ const rec = normRec(user.records[tk], tk);
 if (openToday && !openToday.out) {
 openToday.out = t; openToday.outDate = tk;
 if (!rec.place) rec.place = place;
+rec.updatedAt = Date.now();
 user.records[tk] = rec;
 saveDB(); cloudPush(tk); renderAll();
 return { ok: true, msg: `离馆打卡成功 · ${place} ${t}` };
 }
 rec.segs.push({ in: t, out: null, inDate: tk, outDate: null });
 if (!rec.place) rec.place = place;
+rec.updatedAt = Date.now();
 user.records[tk] = rec;
 saveDB(); cloudPush(tk); renderAll();
 renderQuote();
@@ -1884,6 +1922,14 @@ renderCalendar(); renderDayPanel();
 /* =========================================================
 当日面板
 ========================================================= */
+let noteDirty = false;
+// 笔记还没保存就想关页面时拦一下
+window.addEventListener('beforeunload', e => {
+if (!noteDirty) return;
+e.preventDefault();
+e.returnValue = '';
+return '';
+});
 const WEEK_CN = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
 function segLabel(s) {
 if (!s) return '';
@@ -2003,6 +2049,7 @@ const rec = normRec(user.records[tk], tk);
 if (rec.segs.some(s => !s.out)) return toast('今天已经在馆中，请先离馆');
 const t = nowHM();
 rec.segs.push({ in: t, out: null, inDate: tk, outDate: null });
+rec.updatedAt = Date.now();
 user.records[tk] = rec;
 saveDB(); cloudPush(tk); renderAll();
 toast(`入馆打卡成功 · ${t}`);
@@ -2016,6 +2063,7 @@ const open = rec.segs.filter(s => !s.out).pop();
 if (!open) return toast('当前没有在馆中的打卡段');
 // 若这一段是昨天/更早入馆、一直没离馆，先原样补上离馆时间，再开始今天的计时
 open.out = nowHM(); open.outDate = tk;
+rec.updatedAt = Date.now();
 user.records[tk] = rec;
 saveDB(); cloudPush(tk); renderAll();
 const iv = segInterval(open, tk);
@@ -2032,6 +2080,7 @@ const btnAddSeg = $('#btnAddSeg');
 if (btnAddSeg) btnAddSeg.addEventListener('click', () => {
 const rec = normRec(user.records[key], key);
 rec.segs.push({ in: '09:00', out: '12:00', inDate: key, outDate: key });
+rec.updatedAt = Date.now();
 user.records[key] = rec;
 renderDayPanel();
 toast('已加一段，请修改时间后保存');
@@ -2059,7 +2108,7 @@ segs.push({ in: inVal, out: outVal || null, inDate: key, outDate: outVal ? outDa
 }
 if (bad) return toast(bad);
 if (!segs.length) { delete user.records[key]; }
-else { rec.segs = segs; user.records[key] = rec; }
+else { rec.segs = segs; rec.updatedAt = Date.now(); user.records[key] = rec; }
 saveDB(); cloudPush(key); renderAll();
 toast(segs.length ? `已保存 ${segs.length} 段记录` : '这一天已清空');
 });
@@ -2068,7 +2117,8 @@ btnDelSeg.forEach(btn => btn.addEventListener('click', () => {
 const i = Number(btn.dataset.i);
 const rec = normRec(user.records[key], key);
 rec.segs.splice(i, 1);
-if (!rec.segs.length) delete user.records[key]; else user.records[key] = rec;
+if (!rec.segs.length) delete user.records[key];
+else { rec.updatedAt = Date.now(); user.records[key] = rec; }
 saveDB(); cloudPush(key); renderAll();
 toast('已删除这一段');
 }));
@@ -2085,10 +2135,30 @@ toast('已删除');
     if (!r.segs.length) return toast('请先完成打卡再写备注');
     const v = $('#noteInput').value.trim().slice(0, 120);
     r.note = v;
+    r.updatedAt = Date.now();
     user.records[key] = r;
     saveDB(); cloudPush(key);
+    noteDirty = false;
     toast('备注已保存');
   });
+  const noteInputEl = $('#noteInput');
+  if (noteInputEl) {
+    noteInputEl.addEventListener('input', () => { noteDirty = true; });
+    // 失焦自动保存，避免「写了笔记但没点保存」而丢失
+    noteInputEl.addEventListener('blur', () => {
+      if (!noteDirty) return;
+      const r = normRec(user.records[key], key);
+      if (!r.segs.length) return;
+      const v = noteInputEl.value.trim().slice(0, 120);
+      if ((r.note || '') === v) { noteDirty = false; return; }
+      r.note = v;
+      r.updatedAt = Date.now();
+      user.records[key] = r;
+      saveDB(); cloudPush(key);
+      noteDirty = false;
+      toast('备注已自动保存');
+    });
+  }
 }
 /* =========================================================
 统计
