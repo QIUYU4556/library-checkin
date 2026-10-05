@@ -1306,6 +1306,10 @@ const cloudAt = (cloud[key] && cloud[key].updatedAt) || 0;
 if (dayHasData(localRec, key)) {
 if (!cloud[key]) { cloud[key] = normRec(localRec, key); toUpload.push(key); }
 else if (pending[key] || localAt > cloudAt) { cloud[key] = normRec(localRec, key); toUpload.push(key); }
+else if (daySegs(localRec, key).length > daySegs(cloud[key], key).length) {
+// 云端行数比本地少：本地后加的段没推上去，以本地为准并补传
+cloud[key] = normRec(localRec, key); toUpload.push(key);
+}
 }
 }
 // 保留本地有笔记但云端该天笔记为空的情况（避免笔记被空值盖掉）
@@ -2110,7 +2114,7 @@ if (bad) return toast(bad);
 if (!segs.length) { delete user.records[key]; }
 else { rec.segs = segs; rec.updatedAt = Date.now(); user.records[key] = rec; }
 saveDB(); cloudPush(key); renderAll();
-toast(segs.length ? `已保存 ${segs.length} 段记录` : '这一天已清空');
+toast(segs.length ? `已保存 ${segs.length} 段，当天在馆 ${fmtDur(recordMsOnDate(user.records[key], key))}` : '这一天已清空');
 });
 const btnDelSeg = document.querySelectorAll('#dayBody .seg-del');
 btnDelSeg.forEach(btn => btn.addEventListener('click', () => {
